@@ -35,6 +35,7 @@ import org.eclipse.microprofile.reactive.streams.operators.ReactiveStreams;
 import org.eclipse.microprofile.reactive.streams.operators.SubscriberBuilder;
 import org.reactivestreams.Subscription;
 
+import com.rabbitmq.client.AMQP;
 import com.rabbitmq.client.impl.CredentialsProvider;
 
 import io.smallrye.mutiny.Multi;
@@ -241,10 +242,12 @@ public class RabbitMQConnector implements IncomingConnectorFactory, OutgoingConn
         final Integer interval = ic.getReconnectInterval();
         final Integer attempts = ic.getReconnectAttempts();
         Multi<? extends Message<?>> multi = uniQueue
-                .onItem().transformToUni(connection -> client.basicConsumer(ic.getQueueName(), new QueueOptions()
-                        .setAutoAck(ic.getAutoAcknowledgement())
-                        .setMaxInternalQueueSize(ic.getMaxIncomingInternalQueueSize())
-                        .setKeepMostRecent(ic.getKeepMostRecent())))
+                .onItem().transformToUni(connection -> {
+                    return client.basicConsumer(serverQueueName(ic.getQueueName()), new QueueOptions()
+                            .setAutoAck(ic.getAutoAcknowledgement())
+                            .setMaxInternalQueueSize(ic.getMaxIncomingInternalQueueSize())
+                            .setKeepMostRecent(ic.getKeepMostRecent()));
+                })
                 .onItem().transformToMulti(consumer -> getStreamOfMessages(consumer, holder, ic, onNack, onAck))
                 .plug(m -> {
                     if (attempts > 0) {
@@ -464,15 +467,25 @@ public class RabbitMQConnector implements IncomingConnectorFactory, OutgoingConn
         return establishExchange(client, ic)
                 .onItem().transform(v -> Boolean.TRUE.equals(ic.getQueueDeclare()) ? null : queueName)
                 .onItem().ifNull().switchTo(
-                        () -> client
-                                .queueDeclare(queueName, ic.getQueueDurable(), ic.getQueueExclusive(), ic.getQueueAutoDelete(),
-                                        queueArgs)
-                                .onItem().invoke(() -> log.queueEstablished(queueName))
-                                .onFailure().invoke(ex -> log.unableToEstablishQueue(queueName, ex))
-                                .onItem().transformToMulti(v -> establishBindings(client, ic))
-                                // What follows is just to "rejoin" the Multi stream into a single Uni emitting the queue name
-                                .onCompletion().invoke(() -> Multi.createFrom().item("ignore"))
-                                .onItem().ignoreAsUni().onItem().transform(v -> queueName));
+                        () -> {
+                            String serverQueueName = serverQueueName(queueName);
+
+                            Uni<AMQP.Queue.DeclareOk> declare;
+                            if (serverQueueName.isEmpty()) {
+                                declare = client.queueDeclare(serverQueueName, false, true, true);
+                            } else {
+                                declare = client.queueDeclare(serverQueueName, ic.getQueueDurable(),
+                                        ic.getQueueExclusive(), ic.getQueueAutoDelete(), queueArgs);
+                            }
+
+                            return declare
+                                    .onItem().invoke(() -> log.queueEstablished(queueName))
+                                    .onFailure().invoke(ex -> log.unableToEstablishQueue(queueName, ex))
+                                    .onItem().transformToMulti(v -> establishBindings(client, ic))
+                                    // What follows is just to "rejoin" the Multi stream into a single Uni emitting the queue name
+                                    .onCompletion().invoke(() -> Multi.createFrom().item("ignore"))
+                                    .onItem().ignoreAsUni().onItem().transform(v -> queueName);
+                        });
     }
 
     /**
@@ -492,7 +505,7 @@ public class RabbitMQConnector implements IncomingConnectorFactory, OutgoingConn
                 .map(String::trim).collect(Collectors.toList());
 
         return Multi.createFrom().iterable(routingKeys)
-                .onItem().call(routingKey -> client.queueBind(queueName, exchangeName, routingKey))
+                .onItem().call(routingKey -> client.queueBind(serverQueueName(queueName), exchangeName, routingKey))
                 .onItem().invoke(routingKey -> log.bindingEstablished(queueName, exchangeName, routingKey))
                 .onFailure().invoke(ex -> log.unableToEstablishBinding(queueName, exchangeName, ex));
     }
@@ -516,6 +529,13 @@ public class RabbitMQConnector implements IncomingConnectorFactory, OutgoingConn
     private RabbitMQAckHandler createAckHandler(RabbitMQConnectorIncomingConfiguration ic) {
         return (Boolean.TRUE.equals(ic.getAutoAcknowledgement())) ? new RabbitMQAutoAck(ic.getChannel())
                 : new RabbitMQAck(ic.getChannel());
+    }
+
+    private String serverQueueName(String name) {
+        if (name.equals("(server.auto)")) {
+            return "";
+        }
+        return name;
     }
 
     public void reportIncomingFailure(String channel, Throwable reason) {
