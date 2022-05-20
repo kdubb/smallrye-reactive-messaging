@@ -5,7 +5,6 @@ import static io.smallrye.reactive.messaging.annotations.ConnectorAttribute.Dire
 import static io.smallrye.reactive.messaging.annotations.ConnectorAttribute.Direction.OUTGOING;
 import static io.smallrye.reactive.messaging.rabbitmq.i18n.RabbitMQExceptions.ex;
 import static io.smallrye.reactive.messaging.rabbitmq.i18n.RabbitMQLogging.log;
-import static java.time.Duration.ofSeconds;
 
 import java.util.Arrays;
 import java.util.List;
@@ -40,7 +39,6 @@ import com.rabbitmq.client.impl.CredentialsProvider;
 
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
-import io.smallrye.mutiny.operators.multi.processors.BroadcastProcessor;
 import io.smallrye.reactive.messaging.annotations.ConnectorAttribute;
 import io.smallrye.reactive.messaging.health.HealthReport;
 import io.smallrye.reactive.messaging.health.HealthReporter;
@@ -186,20 +184,9 @@ public class RabbitMQConnector implements IncomingConnectorFactory, OutgoingConn
                 .map(String::trim).collect(Collectors.toList());
         log.receiverListeningAddress(queueName);
 
-        // The processor is used to inject AMQP Connection failure in the stream and trigger a retry.
-        BroadcastProcessor<Message<?>> processor = BroadcastProcessor.create();
-        receiver.exceptionHandler(t -> {
-            log.receiverError(t);
-            processor.onError(t);
-        });
-
-        return Multi.createFrom().deferred(
-                () -> {
-                    Multi<Message<?>> stream = receiver.toMulti()
-                            .map(m -> new IncomingRabbitMQMessage<>(m, holder, isTracingEnabled, onNack, onAck))
-                            .map(m -> isTracingEnabled ? TracingUtils.addIncomingTrace(m, queueName, attributeHeaders) : m);
-                    return Multi.createBy().merging().streams(stream, processor);
-                });
+        return receiver.toMulti()
+                .map(m -> new IncomingRabbitMQMessage<>(m, holder, isTracingEnabled, onNack, onAck))
+                .map(m -> isTracingEnabled ? TracingUtils.addIncomingTrace(m, queueName, attributeHeaders) : m);
     }
 
     /**
@@ -237,8 +224,6 @@ public class RabbitMQConnector implements IncomingConnectorFactory, OutgoingConn
         final RabbitMQAckHandler onAck = createAckHandler(ic);
 
         // Once the queue is set up, set up a consumer
-        final Integer interval = ic.getReconnectInterval();
-        final Integer attempts = ic.getReconnectAttempts();
         Multi<? extends Message<?>> multi = holder.getOrEstablishConnection()
                 .onItem().transformToUni(connection -> {
                     return client.basicConsumer(serverQueueName(ic.getQueueName()), new QueueOptions()
@@ -247,20 +232,7 @@ public class RabbitMQConnector implements IncomingConnectorFactory, OutgoingConn
                             .setKeepMostRecent(ic.getKeepMostRecent()));
                 })
                 .onItem().invoke(connection -> incomingChannelStatus.put(ic.getChannel(), ChannelStatus.CONNECTED))
-                .onItem().transformToMulti(consumer -> getStreamOfMessages(consumer, holder, ic, onNack, onAck))
-                .plug(m -> {
-                    if (attempts > 0) {
-                        return m
-                                // Retry on failure.
-                                .onFailure().invoke(log::retrieveMessagesRetrying)
-                                .onFailure().retry().withBackOff(ofSeconds(1), ofSeconds(interval)).atMost(attempts)
-                                .onFailure().invoke(t -> {
-                                    incomingChannelStatus.put(ic.getChannel(), ChannelStatus.NOT_CONNECTED);
-                                    log.retrieveMessagesNoMoreRetrying(t);
-                                });
-                    }
-                    return m;
-                });
+                .onItem().transformToMulti(consumer -> getStreamOfMessages(consumer, holder, ic, onNack, onAck));
 
         if (Boolean.TRUE.equals(ic.getBroadcast())) {
             multi = multi.broadcast().toAllSubscribers();
