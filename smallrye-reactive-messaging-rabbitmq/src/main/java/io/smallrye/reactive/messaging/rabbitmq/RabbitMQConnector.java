@@ -175,7 +175,6 @@ public class RabbitMQConnector implements IncomingConnectorFactory, OutgoingConn
         TracingUtils.initialise();
     }
 
-    @SuppressWarnings({ "rawtypes", "unchecked" })
     private Multi<? extends Message<?>> getStreamOfMessages(RabbitMQConsumer receiver,
             ConnectionHolder holder,
             RabbitMQConnectorIncomingConfiguration ic,
@@ -188,7 +187,7 @@ public class RabbitMQConnector implements IncomingConnectorFactory, OutgoingConn
         log.receiverListeningAddress(queueName);
 
         // The processor is used to inject AMQP Connection failure in the stream and trigger a retry.
-        BroadcastProcessor processor = BroadcastProcessor.create();
+        BroadcastProcessor<Message<?>> processor = BroadcastProcessor.create();
         receiver.exceptionHandler(t -> {
             log.receiverError(t);
             processor.onError(t);
@@ -196,7 +195,7 @@ public class RabbitMQConnector implements IncomingConnectorFactory, OutgoingConn
 
         return Multi.createFrom().deferred(
                 () -> {
-                    Multi<? extends Message<?>> stream = receiver.toMulti()
+                    Multi<Message<?>> stream = receiver.toMulti()
                             .map(m -> new IncomingRabbitMQMessage<>(m, holder, isTracingEnabled, onNack, onAck))
                             .map(m -> isTracingEnabled ? TracingUtils.addIncomingTrace(m, queueName, attributeHeaders) : m);
                     return Multi.createBy().merging().streams(stream, processor);
@@ -225,29 +224,29 @@ public class RabbitMQConnector implements IncomingConnectorFactory, OutgoingConn
 
         // Create a client
         final RabbitMQClient client = RabbitMQClientHelper.createClient(this, ic, clientOptions, credentialsProviders);
+        client.getDelegate().addConnectionEstablishedCallback(promise -> {
+            // Ensure we create the queues (and exchanges) from which messages will be read
+            Uni.createFrom().nullItem()
+                    .onItem().call(() -> establishQueue(client, ic))
+                    .onItem().call(() -> establishDLQ(client, ic))
+                    .subscribe().with(ignored -> promise.complete(), promise::fail);
+        });
 
         final ConnectionHolder holder = new ConnectionHolder(client, ic, getVertx());
         final RabbitMQFailureHandler onNack = createFailureHandler(ic);
         final RabbitMQAckHandler onAck = createAckHandler(ic);
 
-        // Ensure we set the queue up
-        Uni<RabbitMQClient> uniQueue = holder.getOrEstablishConnection()
-                // Once connected, ensure we create the queue from which messages are to be read
-                .onItem().call(connection -> establishQueue(connection, ic))
-                // If directed to do so, create a DLQ
-                .onItem().call(connection -> establishDLQ(connection, ic))
-                .onItem().invoke(connection -> incomingChannelStatus.put(ic.getChannel(), ChannelStatus.CONNECTED));
-
-        // Once the queue is set up, set yp a consumer
+        // Once the queue is set up, set up a consumer
         final Integer interval = ic.getReconnectInterval();
         final Integer attempts = ic.getReconnectAttempts();
-        Multi<? extends Message<?>> multi = uniQueue
+        Multi<? extends Message<?>> multi = holder.getOrEstablishConnection()
                 .onItem().transformToUni(connection -> {
                     return client.basicConsumer(serverQueueName(ic.getQueueName()), new QueueOptions()
                             .setAutoAck(ic.getAutoAcknowledgement())
                             .setMaxInternalQueueSize(ic.getMaxIncomingInternalQueueSize())
                             .setKeepMostRecent(ic.getKeepMostRecent()));
                 })
+                .onItem().invoke(connection -> incomingChannelStatus.put(ic.getChannel(), ChannelStatus.CONNECTED))
                 .onItem().transformToMulti(consumer -> getStreamOfMessages(consumer, holder, ic, onNack, onAck))
                 .plug(m -> {
                     if (attempts > 0) {
@@ -330,18 +329,20 @@ public class RabbitMQConnector implements IncomingConnectorFactory, OutgoingConn
 
         // Create a client
         final RabbitMQClient client = RabbitMQClientHelper.createClient(this, oc, clientOptions, credentialsProviders);
+        client.getDelegate().addConnectionEstablishedCallback(promise -> {
+            // Ensure we create the exchange to which messages are to be sent
+            Uni.createFrom().nullItem()
+                    .onItem().call(ignored -> establishExchange(client, oc))
+                    .subscribe().with((ignored) -> promise.complete(), promise::fail);
+        });
 
         final ConnectionHolder holder = new ConnectionHolder(client, oc, getVertx());
         final Uni<RabbitMQPublisher> getSender = holder.getOrEstablishConnection()
-                // Once connected, ensure we create the exchange to which messages are to be sent
-                .onItem().call(connection -> establishExchange(connection, oc))
-                // Once exchange exists, create ourselves a publisher
                 .onItem().transformToUni(connection -> Uni.createFrom().item(RabbitMQPublisher.create(getVertx(), connection,
                         new RabbitMQPublisherOptions()
                                 .setReconnectAttempts(oc.getReconnectAttempts())
                                 .setReconnectInterval(oc.getReconnectInterval())
-                                .setMaxInternalQueueSize(
-                                        oc.getMaxOutgoingInternalQueueSize().orElse(Integer.MAX_VALUE)))))
+                                .setMaxInternalQueueSize(oc.getMaxOutgoingInternalQueueSize().orElse(Integer.MAX_VALUE)))))
                 // Start the publisher
                 .onItem().call(RabbitMQPublisher::start)
                 .invoke(s -> {
