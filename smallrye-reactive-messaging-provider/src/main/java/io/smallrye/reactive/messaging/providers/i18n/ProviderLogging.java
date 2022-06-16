@@ -129,4 +129,8 @@ public interface ProviderLogging extends BasicLogger {
     @LogMessage(level = Logger.Level.INFO)
     @Message(id = 238, value = "No ExecutionHolder, disabling @Blocking support")
     void noExecutionHolderDisablingBlockingSupport();
+
+    @LogMessage(level = Logger.Level.ERROR)
+    @Message(id = 239, value = "A message failed conversion, ignoring the failure and acknowledging the message.")
+    void conversionFailed(@Cause Throwable t);
 }

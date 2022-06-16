@@ -14,6 +14,7 @@ import org.eclipse.microprofile.reactive.messaging.Message;
 
 import io.smallrye.mutiny.Multi;
 import io.smallrye.reactive.messaging.MessageConverter;
+import io.smallrye.reactive.messaging.providers.i18n.ProviderLogging;
 
 public class ConverterUtils {
 
@@ -25,42 +26,57 @@ public class ConverterUtils {
             Instance<MessageConverter> converters, Type injectedPayloadType) {
         if (injectedPayloadType != null) {
             return upstream
-                    .map(new Function<Message<?>, Message<?>>() {
+                    .flatMap(new Function<Message<?>, Multi<? extends Message<?>>>() {
 
                         MessageConverter actual;
 
                         @Override
-                        public Message<?> apply(Message<?> o) {
+                        public Multi<? extends Message<?>> apply(Message<?> o) {
                             //noinspection ConstantConditions - it can be `null`
                             if (injectedPayloadType == null) {
-                                return o;
+                                return noConversion(o);
                             } else if (o.getPayload() != null && o.getPayload().getClass().equals(injectedPayloadType)) {
-                                return o;
+                                return noConversion(o);
                             }
 
                             if (actual != null) {
                                 // Use the cached converter.
-                                return actual.convert(o, injectedPayloadType);
+                                return convert(actual, o, injectedPayloadType);
                             } else {
                                 if (o.getPayload() != null
                                         && TypeUtils.isAssignable(o.getPayload().getClass(), injectedPayloadType)) {
                                     actual = MessageConverter.IdentityConverter.INSTANCE;
-                                    return o;
+                                    return noConversion(o);
                                 }
                                 // Lookup and cache
                                 for (MessageConverter conv : getSortedConverters(converters)) {
                                     if (conv.canConvert(o, injectedPayloadType)) {
                                         actual = conv;
-                                        return actual.convert(o, injectedPayloadType);
+                                        return convert(actual, o, injectedPayloadType);
                                     }
                                 }
                                 // No converter found
-                                return o;
+                                return noConversion(o);
                             }
                         }
                     });
         }
         return upstream;
+    }
+
+    private static Multi<? extends Message<?>> convert(MessageConverter converter, Message<?> message,
+            Type injectedPayloadType) {
+        return Multi.createFrom().item(message)
+                .map(msg -> converter.convert(message, injectedPayloadType))
+                .onFailure().recoverWithMulti(ex -> {
+                    ProviderLogging.log.conversionFailed(ex);
+                    return Multi.createFrom().completionStage(message.nack(ex))
+                            .flatMap(i -> Multi.createFrom().empty());
+                });
+    }
+
+    private static Multi<? extends Message<?>> noConversion(Message<?> message) {
+        return Multi.createFrom().item(message);
     }
 
     private static List<MessageConverter> getSortedConverters(Instance<MessageConverter> converters) {
